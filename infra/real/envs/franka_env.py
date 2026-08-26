@@ -6,7 +6,6 @@ from scipy.spatial.transform import Rotation
 import time
 import queue
 from collections import OrderedDict
-from collections.abc import Mapping
 from typing import Dict
 from scipy.spatial.transform import Slerp
 
@@ -16,6 +15,7 @@ from infra.hardware.camera.video_capture import VideoCapture
 from infra.hardware.camera.rs_capture import RSCapture
 from infra.hardware.robot.franka_client import FrankaApiClient
 from infra.utils.config_util import as_array, as_dict
+from infra.utils.vision_util import ImageDisplayer
 
 
 
@@ -25,60 +25,20 @@ class FrankaEnv(gym.Env):
         config: DictConfig,
         fake_env=False,
     ):
-        if config is None:
-            raise ValueError("FrankaEnv requires an environment config")
-
         self.config = config
         self.url = str(config.server_url)
         self.hz = float(config.hz)
-        if self.hz <= 0:
-            raise ValueError(f"hz must be positive, got {self.hz}")
 
         self.action_scale = as_array(config.action_scale, "action_scale", ((3,),))
         self.target_pose = as_array(config.target_pose, "target_pose", ((7,),))
         self.reset_pose = as_array(config.reset_pose, "reset_pose", ((7,),))
         self.reward_threshold = as_array(config.reward_threshold, "reward_threshold", ((6,),))
-        if np.any(self.action_scale < 0):
-            raise ValueError("action_scale values must be non-negative")
-        if np.any(self.reward_threshold <= 0):
-            raise ValueError("reward_threshold values must all be positive")
-        for name, pose in (("target_pose", self.target_pose), ("reset_pose", self.reset_pose)):
-            quat_norm = np.linalg.norm(pose[3:])
-            if not np.isclose(quat_norm, 1.0, atol=1e-3):
-                raise ValueError(f"{name} quaternion must be normalized, norm={quat_norm}")
-
-        self.camera_configs = as_dict(
-            config.realsense_cameras,
-            "realsense_cameras",
-        )
-        if not self.camera_configs:
-            raise ValueError("realsense_cameras must contain at least one camera")
-        for camera_name, camera_config in self.camera_configs.items():
-            if not isinstance(camera_config, Mapping):
-                raise TypeError(
-                    f"Camera config {camera_name!r} must be a mapping, "
-                    f"got {type(camera_config).__name__}"
-                )
-            if "serial_number" not in camera_config:
-                raise ValueError(
-                    f"Camera config {camera_name!r} requires serial_number"
-                )
+        self.camera_configs = as_dict(config.realsense_cameras, "realsense_cameras")
 
         crop_config = as_dict(config.image_crop, "image_crop")
-        unknown_crop_keys = crop_config.keys() - self.camera_configs.keys()
-        if unknown_crop_keys:
-            raise ValueError(
-                f"image_crop contains unknown cameras: {sorted(unknown_crop_keys)}"
-            )
         self.image_crop: dict[str, tuple[int, int, int, int]] = {}
         for camera_name, bounds in crop_config.items():
-            if len(bounds) != 4:
-                raise ValueError(
-                    f"image_crop.{camera_name} must be [top, bottom, left, right]"
-                )
             top, bottom, left, right = (int(value) for value in bounds)
-            if min(top, left) < 0 or bottom <= top or right <= left:
-                raise ValueError(f"Invalid crop bounds for {camera_name!r}: {bounds}")
             self.image_crop[camera_name] = (top, bottom, left, right)
 
         self.compliance_param = as_dict(config.compliance_param, "compliance_param")
@@ -93,8 +53,6 @@ class FrankaEnv(gym.Env):
             self.target_pose[:3] + xyz_limit_high,
             dtype=np.float64,
         )
-        if np.any(self.xyz_bounding_box.low >= self.xyz_bounding_box.high):
-            raise ValueError("The configured xyz safety bounds must have positive width")
 
         self.lastsent = time.time()
         self.pose_clip = bool(config.pose_clip)
@@ -115,11 +73,6 @@ class FrankaEnv(gym.Env):
         self.random_rz_range_neg = float(config.random_rz_range_neg)
 
         self.joint_reset_period = int(config.joint_reset_period)
-        if self.joint_reset_period < 0:
-            raise ValueError(
-                f"joint_reset_period must be non-negative, "
-                f"got {self.joint_reset_period}"
-            )
 
         # Action/Observation Space
         self.action_space = gym.spaces.Box(
