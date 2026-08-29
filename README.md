@@ -114,7 +114,7 @@ source /opt/ros/humble/setup.bash
 
 mkdir -p ~/franka_ros2_ws/src
 cd ~/franka_ros2_ws/src
-git clone https://github.com/liusong-0086/serl_controller_ros2.git
+git clone https://github.com/liusong-0086/serl_franka_controllers_ros2.git
 
 cd ~/franka_ros2_ws
 rosdep install --from-paths src --ignore-src -r -y

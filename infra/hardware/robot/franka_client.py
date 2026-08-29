@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Union
 
@@ -13,7 +11,6 @@ ArrayLike = Union[float, int, Sequence[float], np.ndarray]
 class FrankaClientConfig:
     base_url: str = "http://127.0.0.1:5000"
     timeout: float = 5.0
-
 
 class FrankaApiClient:
     def __init__(self, base_url: str = "http://127.0.0.1:5000", timeout: float = 5.0):
@@ -42,7 +39,6 @@ class FrankaApiClient:
         )
         response.raise_for_status()
 
-        # Some endpoints only return a plain string, keep that behaviour.
         if not response.text:
             return None
         try:
@@ -56,12 +52,11 @@ class FrankaApiClient:
         center_of_mass: ArrayLike,
         load_inertia: ArrayLike,
     ) -> None:
-        self._post(
-            "/set_load",
+        self._post("/set_load",
             {
                 "mass": float(mass),
-                "center_of_mass": self._as_array(center_of_mass, (3,)).tolist(),
-                "load_inertia": self._as_array(load_inertia, (9,)).tolist(),
+                "center_of_mass": np.asarray(center_of_mass, dtype=float).tolist(),
+                "load_inertia": np.asarray(load_inertia, dtype=float).tolist(),
             },
         )
 
@@ -105,17 +100,44 @@ class FrankaApiClient:
             "q": self._to_ndarray(data["q"]),
             "dq": self._to_ndarray(data["dq"]),
             "jacobian": self._to_ndarray(data["jacobian"]),
+            "gripper_pos": self._to_ndarray([data["gripper_pos"]]),
         }
 
-    def servo_pose(self, arr: ArrayLike) -> None:
-        pose_arr = self._as_array(arr, (7,))
+    def pose(self, arr: ArrayLike) -> None:
+        pose_arr = np.asarray(arr, dtype=float)
         self._post("/pose", {"arr": pose_arr.tolist()})
 
-    def joint_reset(self) -> None:
-        self._post("/jointreset", timeout=60.0)
+    def joint_reset(
+        self,
+        target_joint_positions: Sequence[float],
+        motion_duration: float = 10.0,
+    ) -> None:
+        self._post(
+            "/jointreset",
+            {
+                "target_joint_positions": list(target_joint_positions),
+                "motion_duration": motion_duration,
+            },
+            timeout=max(self._config.timeout, motion_duration + 60.0),
+        )
 
     def clear_errors(self) -> None:
         self._post("/clearerr")
+
+    def open_gripper(self) -> None:
+        self._post("/open_gripper")
+
+    def close_gripper(self) -> None:
+        self._post("/close_gripper")
+
+    def close_gripper_slow(self) -> None:
+        self._post("/close_gripper_slow")
+
+    def move_gripper(self, position: int) -> None:
+        self._post("/move_gripper", {"position": position})
+
+    def get_gripper(self) -> float:
+        return float(self._post("/get_gripper")["gripper_pos"])
 
     def update_param(self, values: Mapping[str, Any]) -> None:
         payload: Dict[str, Any] = {}
@@ -124,7 +146,12 @@ class FrankaApiClient:
                 payload[key] = value.astype(float).tolist()
             elif isinstance(value, (list, tuple)):
                 payload[key] = [
-                    float(item) if isinstance(item, (float, int, np.floating, np.integer)) else item
+                    float(item)
+                    if isinstance(
+                        item,
+                        (float, int, np.floating, np.integer),
+                    )
+                    else item
                     for item in value
                 ]
             elif isinstance(value, (int, np.integer)) and not isinstance(value, bool):
@@ -132,13 +159,3 @@ class FrankaApiClient:
             else:
                 payload[key] = value
         self._post("/update_param", payload)
-
-    def close(self) -> None:
-        self._session.close()
-
-    def _as_array(self, values: ArrayLike, 
-                  shape: Optional[tuple] = None) -> np.ndarray:
-        arr = np.asarray(values, dtype=float)
-        if shape is not None and arr.shape != shape:
-            raise ValueError(f"Expected shape {shape}, got {arr.shape}")
-        return arr

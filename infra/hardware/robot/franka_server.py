@@ -1,7 +1,9 @@
+import json
 import logging
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -12,7 +14,7 @@ from scipy.spatial.transform import Rotation as R
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from franka_msgs.action import ErrorRecovery
+from franka_msgs.action import ErrorRecovery, Grasp, Move
 from franka_msgs.msg import FrankaRobotState
 from franka_msgs.srv import SetLoad
 from geometry_msgs.msg import PoseStamped
@@ -23,41 +25,18 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string(
-    "robot_ip",
-    "172.16.0.2",
-    "IP address of the Franka controller box.",
-)
-flags.DEFINE_string(
-    "robot_type",
-    "fr3",
-    "Franka robot type.",
-)
-flags.DEFINE_string(
-    "namespace",
-    "",
-    "Optional ROS 2 namespace.",
-)
-flags.DEFINE_list(
-    "reset_joint_target",
-    [0, 0, 0, -1.9, 0, 2, 0],
-    "Must match target_joint_positions in the controller YAML.",
-)
-flags.DEFINE_string(
-    "flask_url",
-    "127.0.0.1",
-    "Address on which Flask listens.",
-)
-flags.DEFINE_integer(
-    "flask_port",
-    5000,
-    "Port on which Flask listens.",
-)
+flags.DEFINE_string("robot_ip", "172.16.0.2", "IP address of the Franka controller box.")
+flags.DEFINE_string("robot_type", "fr3", "Franka robot type.")
+flags.DEFINE_string("namespace", "", "Optional ROS 2 namespace.")
+flags.DEFINE_string("flask_url", "127.0.0.1", "Address on which Flask listens.")
+flags.DEFINE_integer("flask_port", 5000, "Port on which Flask listens.")
+flags.DEFINE_bool("load_gripper", False, "Whether to load the Franka gripper.")
 
 
 _LAUNCH_STOP_STEPS = (
@@ -77,7 +56,6 @@ def _handle_shutdown_signal(_signum, _frame):
 
 
 def ros_name(namespace, name):
-    """Construct an absolute ROS 2 interface name."""
     namespace = namespace.strip().strip("/")
     name = name.strip("/")
 
@@ -93,32 +71,15 @@ class FrankaServer(Node):
         robot_ip,
         robot_type,
         namespace,
-        reset_joint_target,
+        load_gripper,
     ):
         node_namespace = namespace.strip().strip("/") or None
-
-        super().__init__(
-            "franka_control_api",
-            namespace=node_namespace,
-        )
+        super().__init__("franka_control_api", namespace=node_namespace)
 
         self.robot_ip = robot_ip
         self.robot_type = robot_type
+        self.load_gripper = load_gripper
         self.namespace_name = namespace.strip().strip("/")
-        self.reset_joint_target = np.asarray(
-            reset_joint_target,
-            dtype=float,
-        )
-
-        if self.reset_joint_target.shape != (7,):
-            raise ValueError(
-                "reset_joint_target must contain seven values."
-            )
-
-        if not np.all(np.isfinite(self.reset_joint_target)):
-            raise ValueError(
-                "reset_joint_target must contain finite values."
-            )
 
         self.state_lock = threading.Lock()
         self.state_sequence = 0
@@ -131,65 +92,36 @@ class FrankaServer(Node):
         self.torque = np.zeros(3)
         self.jacobian = np.zeros((6, 7))
         self.vel = np.zeros(6)
-
+        self.gripper_pos = 0.0
+        self.binary_gripper_pose = 0
         self.impedance_process = None
         self.joint_process = None
         self.process_lock = threading.RLock()
         self.shutting_down = False
 
-        self.eepub = self.create_publisher(
-            PoseStamped,
-            ros_name(
-                namespace,
-                "cartesian_impedance_controller/equilibrium_pose",
-            ),
-            10,
-        )
+        self.eepub = self.create_publisher(PoseStamped,ros_name(namespace, 
+                            "cartesian_impedance_controller/equilibrium_pose"), 10)
+        
+        self.state_sub = self.create_subscription(FrankaRobotState, ros_name( namespace,
+                            "franka_robot_state_broadcaster/robot_state"), self._set_currpos,
+                            qos_profile_sensor_data)
+        self.jacobian_sub = self.create_subscription(Float64MultiArray, ros_name(namespace,
+                            "cartesian_impedance_controller/franka_jacobian"), self._set_jacobian,
+                            qos_profile_sensor_data)
+        self.gripper_sub = self.create_subscription(JointState, ros_name(namespace, 
+                            "franka_gripper/joint_states"), self._update_gripper, qos_profile_sensor_data)
 
-        self.state_sub = self.create_subscription(
-            FrankaRobotState,
-            ros_name(
-                namespace,
-                "franka_robot_state_broadcaster/robot_state",
-            ),
-            self._set_currpos,
-            qos_profile_sensor_data,
-        )
+        self.error_recovery_client = ActionClient(self, ErrorRecovery, ros_name(namespace, 
+                            "action_server/error_recovery"))
+        self.set_load_client = self.create_client(SetLoad, ros_name(namespace,
+                            "service_server/set_load"))
+        self.parameter_client = self.create_client(SetParameters, ros_name(namespace,
+                            "cartesian_impedance_controller/set_parameters"))
+        self.gripper_move_client = ActionClient(self, Move, ros_name(namespace, 
+                            "franka_gripper/move"))
+        self.gripper_grasp_client = ActionClient(self, Grasp, ros_name(namespace, 
+                            "franka_gripper/grasp"))
 
-        self.jacobian_sub = self.create_subscription(
-            Float64MultiArray,
-            ros_name(
-                namespace,
-                "cartesian_impedance_controller/franka_jacobian",
-            ),
-            self._set_jacobian,
-            qos_profile_sensor_data,
-        )
-
-        self.error_recovery_client = ActionClient(
-            self,
-            ErrorRecovery,
-            ros_name(
-                namespace,
-                "action_server/error_recovery",
-            ),
-        )
-
-        self.set_load_client = self.create_client(
-            SetLoad,
-            ros_name(
-                namespace,
-                "service_server/set_load",
-            ),
-        )
-
-        self.parameter_client = self.create_client(
-            SetParameters,
-            ros_name(
-                namespace,
-                "cartesian_impedance_controller/set_parameters",
-            ),
-        )
 
     @staticmethod
     def _wait_future(
@@ -197,86 +129,44 @@ class FrankaServer(Node):
         timeout,
         description,
     ):
-        """Wait for a future while the executor spins in another thread."""
         finished = threading.Event()
         future.add_done_callback(lambda _: finished.set())
 
         if not finished.wait(timeout):
-            raise TimeoutError(
-                f"Timed out waiting for {description}."
-            )
+            raise TimeoutError(f"Timed out waiting for {description}.")
 
         exception = future.exception()
         if exception is not None:
-            raise RuntimeError(
-                f"{description} failed: {exception}"
-            )
+            raise RuntimeError(f"{description} failed: {exception}")
 
         return future.result()
 
     def _set_currpos(self, msg):
         joint_state = msg.measured_joint_state
 
-        if (
-            len(joint_state.position) < 7
-            or len(joint_state.velocity) < 7
-        ):
-            self.get_logger().warning(
-                "Received incomplete Franka joint state."
-            )
+        if (len(joint_state.position) < 7 or len(joint_state.velocity) < 7):
+            self.get_logger().warning("Received incomplete Franka joint state.")
             return
 
         pose = msg.o_t_ee.pose
         wrench = msg.k_f_ext_hat_k.wrench
 
         with self.state_lock:
-            self.pos = np.array(
-                [
-                    pose.position.x,
-                    pose.position.y,
-                    pose.position.z,
-                    pose.orientation.x,
-                    pose.orientation.y,
-                    pose.orientation.z,
-                    pose.orientation.w,
-                ],
-                dtype=float,
-            )
+            self.pos = np.array([pose.position.x, pose.position.y, pose.position.z,
+                    pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w], dtype=float)
 
-            self.q = np.asarray(
-                joint_state.position[:7],
-                dtype=float,
-            )
-            self.dq = np.asarray(
-                joint_state.velocity[:7],
-                dtype=float,
-            )
+            self.q = np.asarray(joint_state.position[:7], dtype=float)
+            self.dq = np.asarray(joint_state.velocity[:7], dtype=float)
 
-            self.force = np.array(
-                [
-                    wrench.force.x,
-                    wrench.force.y,
-                    wrench.force.z,
-                ],
-                dtype=float,
-            )
-            self.torque = np.array(
-                [
-                    wrench.torque.x,
-                    wrench.torque.y,
-                    wrench.torque.z,
-                ],
-                dtype=float,
-            )
+            self.force = np.array([wrench.force.x, wrench.force.y, wrench.force.z], dtype=float)
+            self.torque = np.array([wrench.torque.x, wrench.torque.y, wrench.torque.z], dtype=float)
 
             self.vel = self.jacobian @ self.dq
             self.state_sequence += 1
 
     def _set_jacobian(self, msg):
         if len(msg.data) != 42:
-            self.get_logger().warning(
-                f"Expected 42 Jacobian values, got {len(msg.data)}."
-            )
+            self.get_logger().warning(f"Expected 42 Jacobian values, got {len(msg.data)}.")
             return
         jacobian = np.asarray(
             msg.data,
@@ -300,29 +190,47 @@ class FrankaServer(Node):
                 "q": self.q.copy(),
                 "dq": self.dq.copy(),
                 "jacobian": self.jacobian.copy(),
+                "gripper_pos": self.gripper_pos,
                 "sequence": self.state_sequence,
             }
 
+    def _send_gripper_goal(self, client, goal):
+        if not client.wait_for_server(timeout_sec=5.0):
+            raise RuntimeError("Gripper action server is not available.")
+        return client.send_goal_async(goal)
+
+    def open_gripper(self):
+        if self.binary_gripper_pose == 0:
+            return
+        goal = Move.Goal(width=0.08, speed=0.3)
+        self._send_gripper_goal(self.gripper_move_client, goal)
+        self.binary_gripper_pose = 0
+
+    def close_gripper(self, speed=0.3):
+        if self.binary_gripper_pose == 1:
+            return
+        goal = Grasp.Goal(width=0.01, speed=speed, force=1.0)
+        goal.epsilon.inner = 1.0
+        goal.epsilon.outer = 1.0
+        self._send_gripper_goal(self.gripper_grasp_client, goal)
+        self.binary_gripper_pose = 1
+
+    def close_gripper_slow(self):
+        self.close_gripper(speed=0.1)
+
+    def move_gripper(self, position):
+        goal = Move.Goal(width=float(position) / 255.0 * 0.08, speed=0.3)
+        return self._send_gripper_goal(self.gripper_move_client, goal)
+
+    def _update_gripper(self, msg):
+        with self.state_lock:
+            self.gripper_pos = sum(msg.position) / 0.08
+
     def move(self, pose):
-        pose = np.asarray(
-            pose,
-            dtype=float,
-        )
+        pose = np.asarray(pose, dtype=float)
 
         if pose.shape != (7,):
-            raise ValueError(
-                "Pose must be [x, y, z, qx, qy, qz, qw]."
-            )
-
-        if not np.all(np.isfinite(pose)):
-            raise ValueError(
-                "Pose must contain finite values."
-            )
-
-        if np.linalg.norm(pose[3:]) < 1e-8:
-            raise ValueError(
-                "Pose quaternion must be non-zero."
-            )
+            raise ValueError("Pose must be [x, y, z, qx, qy, qz, qw].")
 
         msg = PoseStamped()
         msg.header.frame_id = "base"
@@ -340,39 +248,19 @@ class FrankaServer(Node):
         self.eepub.publish(msg)
 
     def clear(self, timeout=10.0):
-        """Run the Franka ROS 2 error recovery action."""
-        if not self.error_recovery_client.wait_for_server(
-            timeout_sec=timeout
-        ):
-            raise RuntimeError(
-                "Error recovery action is not available."
-            )
+        if not self.error_recovery_client.wait_for_server(timeout_sec=timeout):
+            raise RuntimeError("Error recovery action is not available.")
 
-        goal_future = self.error_recovery_client.send_goal_async(
-            ErrorRecovery.Goal()
-        )
-
-        goal_handle = self._wait_future(
-            goal_future,
-            timeout,
-            "error recovery goal",
-        )
+        goal_future = self.error_recovery_client.send_goal_async(ErrorRecovery.Goal())
+        goal_handle = self._wait_future(goal_future, timeout, "error recovery goal")
 
         if not goal_handle.accepted:
-            raise RuntimeError(
-                "Error recovery goal was rejected."
-            )
+            raise RuntimeError("Error recovery goal was rejected.")
 
-        result = self._wait_future(
-            goal_handle.get_result_async(),
-            timeout,
-            "error recovery result",
-        )
+        result = self._wait_future(goal_handle.get_result_async(), timeout, "error recovery result")
 
         if result.status != GoalStatus.STATUS_SUCCEEDED:
-            raise RuntimeError(
-                f"Error recovery failed with status {result.status}."
-            )
+            raise RuntimeError(f"Error recovery failed with status {result.status}.")
 
     def set_load(
         self,
@@ -381,41 +269,14 @@ class FrankaServer(Node):
         load_inertia,
         timeout=10.0,
     ):
-        center_of_mass = np.asarray(
-            center_of_mass,
-            dtype=float,
-        )
-        load_inertia = np.asarray(
-            load_inertia,
-            dtype=float,
-        )
+        center_of_mass = np.asarray(center_of_mass, dtype=float)
+        load_inertia = np.asarray(load_inertia, dtype=float)
 
         if center_of_mass.shape != (3,):
-            raise ValueError(
-                "center_of_mass must contain three values."
-            )
+            raise ValueError("center_of_mass must contain three values.")
 
         if load_inertia.shape != (9,):
-            raise ValueError(
-                "load_inertia must contain nine values."
-            )
-
-        if not np.all(np.isfinite(center_of_mass)):
-            raise ValueError(
-                "center_of_mass must contain finite values."
-            )
-
-        if not np.all(np.isfinite(load_inertia)):
-            raise ValueError(
-                "load_inertia must contain finite values."
-            )
-
-        if not self.set_load_client.wait_for_service(
-            timeout_sec=timeout
-        ):
-            raise RuntimeError(
-                "set_load service is not available."
-            )
+            raise ValueError("load_inertia must contain nine values.")
 
         req = SetLoad.Request()
         req.mass = float(mass)
@@ -429,22 +290,13 @@ class FrankaServer(Node):
         )
 
         if not response.success:
-            raise RuntimeError(
-                response.error or "Failed to set load."
-            )
+            raise RuntimeError(response.error or "Failed to set load.")
 
     def update_parameters(
         self,
         values,
         timeout=10.0,
     ):
-        if not self.parameter_client.wait_for_service(
-            timeout_sec=timeout
-        ):
-            raise RuntimeError(
-                "Controller parameter service is not available."
-            )
-
         parameters = []
 
         for name, value in values.items():
@@ -459,21 +311,12 @@ class FrankaServer(Node):
                     for item in value
                 ]
 
-            parameters.append(
-                Parameter(
-                    name=name,
-                    value=value,
-                ).to_parameter_msg()
-            )
+            parameters.append(Parameter(name=name, value=value).to_parameter_msg())
 
         req = SetParameters.Request()
         req.parameters = parameters
 
-        response = self._wait_future(
-            self.parameter_client.call_async(req),
-            timeout,
-            "controller parameter response",
-        )
+        response = self._wait_future(self.parameter_client.call_async(req), timeout, "controller parameter response")
 
         errors = [
             result.reason
@@ -488,9 +331,8 @@ class FrankaServer(Node):
         launch_arguments = [
             f"robot_ip:={self.robot_ip}",
             f"robot_type:={self.robot_type}",
-            "load_gripper:=false",
+            f"load_gripper:={'true' if self.load_gripper else 'false'}",
         ]
-
         if self.namespace_name:
             launch_arguments.append(
                 f"namespace:={self.namespace_name}"
@@ -507,9 +349,6 @@ class FrankaServer(Node):
         except PermissionError:
             return True
 
-        # killpg() also succeeds while a process group contains only zombies.
-        # Ignore those entries so completed ROS launch trees are not reported
-        # as live while their final status is being reaped.
         try:
             process_entries = os.scandir("/proc")
         except OSError:
@@ -521,10 +360,7 @@ class FrankaServer(Node):
                     continue
 
                 try:
-                    with open(
-                        f"/proc/{entry.name}/stat",
-                        encoding="utf-8",
-                    ) as stat_file:
+                    with open(f"/proc/{entry.name}/stat", encoding="utf-8") as stat_file:
                         process_stat = stat_file.read()
 
                     command_end = process_stat.rfind(")")
@@ -571,7 +407,7 @@ class FrankaServer(Node):
         process.poll()
         return not cls._process_group_exists(process.pid)
 
-    def _start_launch(self, launch_file):
+    def _start_launch(self, launch_file, extra_arguments=()):
         return subprocess.Popen(
             [
                 "ros2",
@@ -579,6 +415,7 @@ class FrankaServer(Node):
                 "serl_franka_controllers_ros2",
                 launch_file,
                 *self._launch_arguments(),
+                *extra_arguments,
             ],
             start_new_session=True,
         )
@@ -626,7 +463,6 @@ class FrankaServer(Node):
             )
 
     def start_impedance(self):
-        """Launch impedance.launch.py."""
         with self.process_lock:
             if self.shutting_down:
                 return
@@ -658,8 +494,7 @@ class FrankaServer(Node):
             )
             self.impedance_process = None
 
-    def start_joint_controller(self):
-        """Launch joint.launch.py."""
+    def start_joint_controller(self, joint_params_file):
         with self.process_lock:
             if self.shutting_down:
                 return
@@ -679,7 +514,8 @@ class FrankaServer(Node):
                 )
 
             self.joint_process = self._start_launch(
-                "joint.launch.py"
+                "joint.launch.py",
+                [f"joint_params_file:={joint_params_file}"],
             )
             time.sleep(5.0)
 
@@ -691,21 +527,45 @@ class FrankaServer(Node):
             )
             self.joint_process = None
 
-    def reset_joint(self):
-        self.stop_impedance()
-        self.start_joint_controller()
+    @staticmethod
+    def _create_joint_params_file(target_joint_positions, motion_duration):
+        params = {
+            "/**/joint_position_controller": {
+                "ros__parameters": {
+                    "target_joint_positions": target_joint_positions.tolist(),
+                    "motion_duration": motion_duration,
+                }
+            }
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="serl_joint_reset_",
+            suffix=".yaml",
+            delete=False,
+        ) as params_file:
+            json.dump(params, params_file)
+            return params_file.name
 
-        initial_sequence = self.get_state()["sequence"]
+    def reset_joint(self, target_joint_positions, motion_duration):
+        target_joint_positions = np.asarray(target_joint_positions, dtype=float)
+        motion_duration = float(motion_duration)
+
+        joint_params_file = self._create_joint_params_file(
+            target_joint_positions,
+            motion_duration,
+        )
 
         try:
+            self.stop_impedance()
+            self.start_joint_controller(joint_params_file)
+            initial_sequence = self.get_state()["sequence"]
+
             try:
                 self.clear()
             except RuntimeError as error:
-                self.get_logger().warning(
-                    str(error)
-                )
+                self.get_logger().warning(str(error))
 
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + max(30.0, motion_duration + 10.0)
 
             while time.monotonic() < deadline:
                 state = self.get_state()
@@ -715,7 +575,7 @@ class FrankaServer(Node):
                 )
                 reached_target = np.allclose(
                     state["q"],
-                    self.reset_joint_target,
+                    target_joint_positions,
                     atol=1e-2,
                     rtol=1e-2,
                 )
@@ -731,6 +591,10 @@ class FrankaServer(Node):
 
         finally:
             self.stop_joint_controller()
+            try:
+                os.unlink(joint_params_file)
+            except FileNotFoundError:
+                pass
             self.start_impedance()
 
     def shutdown(self):
@@ -755,10 +619,7 @@ def main(_):
         robot_ip=FLAGS.robot_ip,
         robot_type=FLAGS.robot_type,
         namespace=FLAGS.namespace,
-        reset_joint_target=[
-            float(value)
-            for value in FLAGS.reset_joint_target
-        ],
+        load_gripper=FLAGS.load_gripper,
     )
 
     executor = MultiThreadedExecutor(
@@ -814,74 +675,49 @@ def main(_):
         pose = robot_server.get_state()["pose"]
         xyz = pose[:3]
 
-        euler = R.from_quat(
-            pose[3:]
-        ).as_euler("xyz")
+        euler = R.from_quat(pose[3:]).as_euler("xyz")
 
-        return jsonify(
-            {
-                "pose": np.concatenate(
-                    [xyz, euler]
-                ).tolist()
-            }
-        )
+        return jsonify({"pose": np.concatenate([xyz, euler]).tolist()})
 
     @webapp.route("/getpos", methods=["POST"])
     def get_pos():
         state = robot_server.get_state()
-        return jsonify(
-            {"pose": state["pose"].tolist()}
-        )
+        return jsonify({"pose": state["pose"].tolist()})
 
     @webapp.route("/getvel", methods=["POST"])
     def get_vel():
         state = robot_server.get_state()
-        return jsonify(
-            {"vel": state["vel"].tolist()}
-        )
+        return jsonify({"vel": state["vel"].tolist()})
 
     @webapp.route("/getforce", methods=["POST"])
     def get_force():
         state = robot_server.get_state()
-        return jsonify(
-            {"force": state["force"].tolist()}
-        )
+        return jsonify({"force": state["force"].tolist()})
 
     @webapp.route("/gettorque", methods=["POST"])
     def get_torque():
         state = robot_server.get_state()
-        return jsonify(
-            {"torque": state["torque"].tolist()}
-        )
+        return jsonify({"torque": state["torque"].tolist()})
 
     @webapp.route("/getq", methods=["POST"])
     def get_q():
         state = robot_server.get_state()
-        return jsonify(
-            {"q": state["q"].tolist()}
-        )
+        return jsonify({"q": state["q"].tolist()})
 
     @webapp.route("/getdq", methods=["POST"])
     def get_dq():
         state = robot_server.get_state()
-        return jsonify(
-            {"dq": state["dq"].tolist()}
-        )
+        return jsonify({"dq": state["dq"].tolist()})
 
     @webapp.route("/getjacobian", methods=["POST"])
     def get_jacobian():
         state = robot_server.get_state()
-        return jsonify(
-            {
-                "jacobian": state[
-                    "jacobian"
-                ].tolist()
-            }
-        )
+        return jsonify({"jacobian": state["jacobian"].tolist()})
 
     @webapp.route("/jointreset", methods=["POST"])
     def joint_reset():
-        robot_server.reset_joint()
+        data = request.get_json()
+        robot_server.reset_joint(data["target_joint_positions"], data["motion_duration"])
         return "Reset Joint"
 
     @webapp.route("/clearerr", methods=["POST"])
@@ -889,11 +725,33 @@ def main(_):
         robot_server.clear()
         return "Clear"
 
+    @webapp.route("/open_gripper", methods=["POST"])
+    def open_gripper():
+        robot_server.open_gripper()
+        return "Opened gripper"
+
+    @webapp.route("/close_gripper", methods=["POST"])
+    def close_gripper():
+        robot_server.close_gripper()
+        return "Closed gripper"
+
+    @webapp.route("/close_gripper_slow", methods=["POST"])
+    def close_gripper_slow():
+        robot_server.close_gripper_slow()
+        return "Closed gripper slowly"
+
+    @webapp.route("/move_gripper", methods=["POST"])
+    def move_gripper():
+        robot_server.move_gripper(request.get_json()["position"])
+        return "Moved gripper"
+
+    @webapp.route("/get_gripper", methods=["POST"])
+    def get_gripper():
+        return jsonify({"gripper_pos": robot_server.get_state()["gripper_pos"]})
+
     @webapp.route("/pose", methods=["POST"])
     def pose():
-        robot_server.move(
-            request.get_json()["arr"]
-        )
+        robot_server.move(request.get_json()["arr"])
         return "Moved"
 
     @webapp.route("/getstate", methods=["POST"])
@@ -908,30 +766,23 @@ def main(_):
                 "torque": state["torque"].tolist(),
                 "q": state["q"].tolist(),
                 "dq": state["dq"].tolist(),
-                "jacobian": state[
-                    "jacobian"
-                ].tolist(),
+                "gripper_pos": state["gripper_pos"],
+                "jacobian": state["jacobian"].tolist(),
             }
         )
 
     @webapp.route("/update_param", methods=["POST"])
     def update_param():
-        robot_server.update_parameters(
-            request.get_json()
-        )
+        robot_server.update_parameters(request.get_json())
         return "Updated compliance parameters"
 
     try:
         robot_server.start_impedance()
 
         try:
-            robot_server.update_parameters(
-                {"publish_jacobian": True}
-            )
+            robot_server.update_parameters({"publish_jacobian": True})
         except RuntimeError as error:
-            robot_server.get_logger().warning(
-                str(error)
-            )
+            robot_server.get_logger().warning(str(error))
 
         webapp.run(
             host=FLAGS.flask_url,
