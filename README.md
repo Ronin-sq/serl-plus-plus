@@ -90,7 +90,7 @@ uv run python -m train.train_serl \
 ### 3. FR3 Real Robot
 
 The real-robot stack uses
-[serl_controller_ros2](https://github.com/liusong-0086/serl_controller_ros2)
+[serl_franka_controllers_ros2](https://github.com/liusong-0086/serl_franka_controllers_ros2)
 as the ROS 2 low-level controller. The data path is:
 
 ```text
